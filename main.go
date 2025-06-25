@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -15,156 +16,171 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
 )
 
 // Compression Option - 7z 무압축(Copy) 모드
 // 7z은 컨테이너에 미리 설치되어 있어야 하며, /var/task/7za 경로에 위치해야함
 const (
-	SevenZipCmd        = "/var/task/7za"
-	SevenZipFormatFlag = "-t7z"
-	SevenZipCopyFlag   = "-m0=Copy"
-	SevenZipThreads    = "-mmt=2"
+	SevenZipCmd        = "/var/task/7za" // 7z 바이너리 경로
+	SevenZipFormatFlag = "-t7z"          // 압축 포맷
+	SevenZipCopyFlag   = "-m0=Copy"      // 무압축 옵션
 	TempDir            = "/tmp"
 	CompressExtension  = ".7z"
+	BufferSize         = 4 * 1024 * 1024
 )
 
-// static s3 client
-var s3Client *s3.Client
+// static client map
+var (
+	s3Clients  = map[string]*s3.Client{}  // 리전별 S3 클라이언트 캐시
+	sqsClients = map[string]*sqs.Client{} // 리전별 SQS 클라이언트 캐시
+)
 
-// (TODO: 환경 변수로 리전 변겸 & 설정 가능하도록 수정)
-func init() {
-	cfg, err := config.LoadDefaultConfig(context.Background(),
-		config.WithRegion("ap-northeast-2"),
-	)
-	if err != nil {
-		log.Fatalf("unable to load AWS SDK config: %v", err)
-	}
-	s3Client = s3.NewFromConfig(cfg)
-}
-
-// Request
+// Lambda Request 구조체
 type FileCompressionForm struct {
-	OriginRegion string `json:"originRegion"`
-	OriginBucket string `json:"originBucket"`
-	OriginKey    string `json:"originKey"`
-	TargetRegion string `json:"targetRegion"`
-	TargetBucket string `json:"targetBucket"`
-	TargetKey    string `json:"targetKey"`
+	ProcessUuid    string `json:"processUuid"`
+	OriginRegion   string `json:"originRegion"`
+	OriginBucket   string `json:"originBucket"`
+	OriginKey      string `json:"originKey"`
+	TargetRegion   string `json:"targetRegion"`
+	TargetBucket   string `json:"targetBucket"`
+	TargetKey      string `json:"targetKey"`
+	DeleteOriginal bool   `json:"deleteOriginal"`
+	QueueRegion    string `json:"queueRegion"`
+	QueueUrl       string `json:"queueUrl"`
 }
 
-// Response
+// Result Response 구조체
 type CompressionResultData struct {
-	Result  string `json:"result"`
-	Message string `json:"message"`
-	Region  string `json:"region"`
-	Bucket  string `json:"bucket"`
-	Key     string `json:"key"`
+	Result      string `json:"result"`
+	Message     string `json:"message"`
+	ProcessUuid string `json:"processUuid"`
+	Region      string `json:"region"`
+	Bucket      string `json:"bucket"`
+	Key         string `json:"key"`
 }
 
-// Entry point for Lambda function
+// 초기화: 환경 변수로부터 리전 받아서 S3/SQS 클라이언트 생성
+func init() {
+	s3Region := os.Getenv("DEFAULT_S3_REGION")
+	if s3Region == "" {
+		s3Region = getLambdaRegion()
+		log.Printf("[WARN] DEFAULT_S3_REGION not set, fallback to Lambda region: %s", s3Region)
+	}
+	s3Clients[s3Region] = createS3Client(s3Region)
+
+	sqsRegion := os.Getenv("DEFAULT_SQS_REGION")
+	if sqsRegion == "" {
+		sqsRegion = getLambdaRegion()
+		log.Printf("[WARN] DEFAULT_SQS_REGION not set, fallback to Lambda region: %s", sqsRegion)
+	}
+	sqsClients[sqsRegion] = createSQSClient(sqsRegion)
+}
+
+// Lambda 엔트리 포인트 핸들러
 func Handler(ctx context.Context, event FileCompressionForm) (CompressionResultData, error) {
 	startTime := time.Now()
 
-	// input validation
+	// request input 유효성 검사
 	if err := validateRequest(event); err != nil {
-		log.Printf("Input validation failed: %v", err)
-		return CompressionResultData{}, fmt.Errorf("input validation failed: %w", err)
+		log.Printf("[ERROR] Invalid request: %v", err)
+		return buildErrorResult(event, err), err
 	}
 
-	// 별도로 Target을 지정하지 않는 경우, Origin 값을 기본 값으로 사용
-	targetBucket := event.TargetBucket
-	if targetBucket == "" {
-		targetBucket = event.OriginBucket
-	}
+	// 기본값 설정 - 별도로 Target을 지정하지 않는 경우, Origin 값을 기본 값으로 사용, TargetKey가 비어있으면 OriginKey의 확장자를 7z 으로 변경하여 사용
+	originRegion := defaultIfEmpty(event.OriginRegion, getLambdaRegion())
+	targetRegion := defaultIfEmpty(event.TargetRegion, originRegion)
+	targetBucket := defaultIfEmpty(event.TargetBucket, event.OriginBucket)
+	targetKey := defaultIfEmpty(event.TargetKey, replaceExtension(event.OriginKey, CompressExtension))
 
-	// TargetKey가 비어있으면 OriginKey의 확장자를 7z 으로 변경하여 사용
-	targetKey := event.TargetKey
-	if targetKey == "" {
-		targetKey = replaceExtension(event.OriginKey, CompressExtension)
-	}
-
-	// 임시 저장 위치 지정(원본, 결과)
+	// 임시 파일 경로 설정
 	inputPath, outputPath := buildTempPaths(event.OriginKey)
+	defer cleanupTemp(inputPath, outputPath)
 
-	// defer를 사용하여 함수 종료 후 임시 파일 정리
-	defer func() {
-		cleanupTemp(inputPath, outputPath)
-	}()
-
-	// S3에서 원본 파일 다운로드
+	// 압축할 파일 다운로드
+	s3Client := getS3Client(originRegion)
 	start := time.Now()
-	originalSize, err := downloadFromS3(ctx, event.OriginBucket, event.OriginKey, inputPath)
+	originalSize, err := downloadFromS3(ctx, s3Client, event.OriginBucket, event.OriginKey, inputPath)
 	if err != nil {
-		log.Printf("Download from S3 failed: %v (took %s)", err, time.Since(start))
-		return CompressionResultData{}, fmt.Errorf("download from S3 failed: %w", err)
+		log.Printf("[ERROR] Download failed: %v (duration: %s)", err, time.Since(start))
+		return buildErrorResult(event, err), err
 	}
-	log.Printf("Download from S3 completed: %d bytes, took %s", originalSize, time.Since(start))
+	log.Printf("Download success: %d bytes (duration: %s)", originalSize, time.Since(start))
 
-	// 7z 포맷으로 파일 압축
+	// 파일 압축 수행
 	start = time.Now()
 	if err := compressFile(inputPath, outputPath); err != nil {
-		log.Printf("File compression failed: %v (took %s)", err, time.Since(start))
-		return CompressionResultData{}, fmt.Errorf("file compression failed: %w", err)
+		log.Printf("[ERROR] Compression failed: %v (duration: %s)", err, time.Since(start))
+		return buildErrorResult(event, err), err
 	}
-	log.Printf("File compression completed, took %s", time.Since(start))
+	log.Printf("Compression success (duration: %s)", time.Since(start))
 
-	// S3에 파일 업로드 (원본과 압축 파일의 Key가 다르면 두개 존재 가능 - 원본은 호출한 측에서 삭제하도록 가이드)
+	// 압축된 파일 지정된 버킷에 업로드
+	s3Client = getS3Client(targetRegion)
 	start = time.Now()
-	compressedSize, err := uploadToS3(ctx, targetBucket, targetKey, outputPath)
+	compressedSize, err := uploadToS3(ctx, s3Client, targetBucket, targetKey, outputPath)
 	if err != nil {
-		log.Printf("Upload to S3 failed: %v (took %s)", err, time.Since(start))
-		return CompressionResultData{}, fmt.Errorf("upload to S3 failed: %w", err)
+		log.Printf("[ERROR] Upload failed: %v (duration: %s)", err, time.Since(start))
+		return buildErrorResult(event, err), err
 	}
-	log.Printf("Upload to S3 completed: %d bytes, took %s", compressedSize, time.Since(start))
+	log.Printf("Upload success: %d bytes (duration: %s)", compressedSize, time.Since(start))
 
-	totalProcessingTime := time.Since(startTime)
-	log.Printf("File processing success. Total processing time: %s", totalProcessingTime)
+	// 원본 삭제(선택 옵션)
+	if event.DeleteOriginal {
+		if err := deleteFromS3(ctx, s3Client, event.OriginBucket, event.OriginKey); err != nil {
+			log.Printf("[WARN] Failed to delete original file: %v", err)
+		} else {
+			log.Printf("Original file deleted: %s/%s", event.OriginBucket, event.OriginKey)
+		}
+	}
 
-	// 성공 응답
-	return CompressionResultData{
-		Result:  "SUCCEED",
-		Message: "Compression succeeded",
-		Region:  event.TargetRegion,
-		Bucket:  targetBucket,
-		Key:     targetKey,
-	}, nil
+	result := CompressionResultData{
+		Result:      "SUCCEED",
+		Message:     "Compression succeeded",
+		Region:      targetRegion,
+		Bucket:      targetBucket,
+		Key:         targetKey,
+		ProcessUuid: event.ProcessUuid,
+	}
+
+	// SQS로 결과 전송
+	if err := sendResultToQueue(event.QueueRegion, event.QueueUrl, result); err != nil {
+		log.Printf("[ERROR] Failed to send SQS message: %v", err)
+		return buildErrorResult(event, err), err
+	}
+
+	log.Printf("File processing success (total time: %s)", time.Since(startTime))
+	return result, nil
 }
 
-// validateRequest는 요청 유효성 검증
-func validateRequest(event FileCompressionForm) error {
-	if event.OriginBucket == "" {
-		return fmt.Errorf("origin bucket is required")
+func defaultIfEmpty(value, def string) string {
+	if value == "" {
+		return def
 	}
-	if event.OriginKey == "" {
-		return fmt.Errorf("origin key is required")
+	return value
+}
+
+func validateRequest(event FileCompressionForm) error {
+	if event.OriginBucket == "" || event.OriginKey == "" {
+		return fmt.Errorf("origin bucket and key required")
 	}
 	// 이미 압축된 파일인지 확인
 	if strings.HasSuffix(event.OriginKey, CompressExtension) {
-		return fmt.Errorf("cannot compress already compressed file (.7z)")
+		return fmt.Errorf("file is already compressed")
 	}
 	return nil
 }
 
-// buildTempPaths는 입력 키로부터 /tmp 경로를 생성
-func buildTempPaths(originKey string) (string, string) {
-	fileName := filepath.Base(originKey)
-	base := strings.TrimSuffix(fileName, filepath.Ext(fileName))
-	inputPath := filepath.Join(TempDir, fmt.Sprintf("%s", fileName))
-	outputPath := filepath.Join(TempDir, fmt.Sprintf("%s%s", base, CompressExtension))
-
-	return inputPath, outputPath
-}
-
-// downloadFromS3는 S3 버킷에서 파일을 다운로드하고 파일 크기 반환
-func downloadFromS3(ctx context.Context, bucket, key, destPath string) (int64, error) {
+// S3 버킷에서 파일을 다운로드하고 파일 크기 반환
+func downloadFromS3(ctx context.Context, client *s3.Client, bucket, key, destPath string) (int64, error) {
 	f, err := os.Create(destPath)
 	if err != nil {
 		return 0, fmt.Errorf("failed to create temp file: %w", err)
 	}
 	defer f.Close()
 
-	// S3에서 파일 다운로드
-	resp, err := s3Client.GetObject(ctx, &s3.GetObjectInput{
+	// 파일 다운로드
+	resp, err := client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
 	})
@@ -182,33 +198,25 @@ func downloadFromS3(ctx context.Context, bucket, key, destPath string) (int64, e
 	return bytesWritten, nil
 }
 
-// compressFile는 7za 바이너리로 무압축(COPY) 압축 실행
+// 7za 바이너리 프로그램으로 압축 수행
 func compressFile(inputPath, outputPath string) error {
-	// 7z 바이너리 존재 확인
 	if _, err := os.Stat(SevenZipCmd); os.IsNotExist(err) {
-		return fmt.Errorf("7z binary not found at %s", SevenZipCmd)
+		return fmt.Errorf("7za binary not found")
 	}
-
 	// 7z 명령어 실행(미리 정의된 옵션 상수 기반으로) (7z 압축은 라이브러리가 아닌 바이너리로 실행)
-	cmd := exec.Command(SevenZipCmd, "a", SevenZipFormatFlag, SevenZipCopyFlag,
-		SevenZipThreads, outputPath, inputPath)
-
-	// 상세한 출력을 위해 환경변수 설정
-	cmd.Env = append(os.Environ(), "LANG=C")
-
+	cmd := exec.Command(SevenZipCmd, "a", SevenZipFormatFlag, SevenZipCopyFlag, outputPath, inputPath)
+	cmd.Env = append(os.Environ(), "LANG=C") // 상세한 출력을 위해 환경변수 설정
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		log.Printf("7za command failed. Command: %v", cmd.Args)
-		log.Printf("7za output: %s", string(out))
-		return fmt.Errorf("7za execution failed: %w, output: %s", err, string(out))
+		log.Printf("[ERROR] 7za failed: %v\n%s", err, out)
+		return fmt.Errorf("7za error: %w", err)
 	}
-
-	log.Printf("7za compression completed successfully")
+	log.Printf("7za compression successful")
 	return nil
 }
 
-// uploadToS3는 파일을 S3에 업로드하고 업로드된 파일 크기 반환
-func uploadToS3(ctx context.Context, bucket, key, sourcePath string) (int64, error) {
+// 파일을 S3에 업로드하고 업로드된 파일 크기 반환
+func uploadToS3(ctx context.Context, client *s3.Client, bucket, key, sourcePath string) (int64, error) {
 	f, err := os.Open(sourcePath)
 	if err != nil {
 		return 0, fmt.Errorf("failed to open source file: %w", err)
@@ -223,12 +231,11 @@ func uploadToS3(ctx context.Context, bucket, key, sourcePath string) (int64, err
 	fileSize := fileInfo.Size()
 
 	// S3에 파일 업로드
-	_, err = s3Client.PutObject(ctx, &s3.PutObjectInput{
+	_, err = client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
 		Body:   f,
 	})
-
 	if err != nil {
 		return 0, fmt.Errorf("failed to put S3 object: %w", err)
 	}
@@ -236,7 +243,38 @@ func uploadToS3(ctx context.Context, bucket, key, sourcePath string) (int64, err
 	return fileSize, nil
 }
 
-// replaceExtension은 파일 확장자를 변경
+func deleteFromS3(ctx context.Context, client *s3.Client, bucket, key string) error {
+	_, err := client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	})
+	return err
+}
+
+func sendResultToQueue(region, queueUrl string, result CompressionResultData) error {
+	client := getSQSClient(region)
+	body, err := json.Marshal(result)
+	if err != nil {
+		return err
+	}
+	_, err = client.SendMessage(context.Background(), &sqs.SendMessageInput{
+		QueueUrl:    aws.String(queueUrl),
+		MessageBody: aws.String(string(body)),
+	})
+	return err
+}
+
+// 입력 키로부터 /tmp 경로를 생성
+func buildTempPaths(originKey string) (string, string) {
+	fileName := filepath.Base(originKey)
+	base := strings.TrimSuffix(fileName, filepath.Ext(fileName))
+	inputPath := filepath.Join(TempDir, fileName)
+	outputPath := filepath.Join(TempDir, base+CompressExtension)
+
+	return inputPath, outputPath
+}
+
+// 파일 확장자 변경 메서드
 func replaceExtension(key, newExtension string) string {
 	ext := filepath.Ext(key)
 	if ext == "" {
@@ -245,13 +283,62 @@ func replaceExtension(key, newExtension string) string {
 	return key[:len(key)-len(ext)] + newExtension
 }
 
-// cleanupTemp은 임시 파일을 삭제
+// 임시 파일 삭제
 func cleanupTemp(paths ...string) {
 	for _, p := range paths {
 		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
-			log.Printf("Failed to remove temp file %s: %v", p, err)
+			log.Printf("[WARN] Failed to delete temp file %s: %v", p, err)
 		}
 	}
+}
+
+func buildErrorResult(event FileCompressionForm, err error) CompressionResultData {
+	return CompressionResultData{
+		Result:      "FAILED",
+		Message:     err.Error(),
+		Region:      event.OriginRegion,
+		Bucket:      event.OriginBucket,
+		Key:         event.OriginKey,
+		ProcessUuid: event.ProcessUuid,
+	}
+}
+
+func getLambdaRegion() string {
+	return os.Getenv("AWS_REGION")
+}
+
+func createS3Client(region string) *s3.Client {
+	cfg, err := config.LoadDefaultConfig(context.Background(), config.WithRegion(region))
+	if err != nil {
+		log.Fatalf("[ERROR] Failed to load S3 config for region %s: %v", region, err)
+	}
+	return s3.NewFromConfig(cfg)
+}
+
+func createSQSClient(region string) *sqs.Client {
+	cfg, err := config.LoadDefaultConfig(context.Background(), config.WithRegion(region))
+	if err != nil {
+		log.Fatalf("[ERROR] Failed to load SQS config for region %s: %v", region, err)
+	}
+	return sqs.NewFromConfig(cfg)
+}
+
+func getS3Client(region string) *s3.Client {
+	if client, ok := s3Clients[region]; ok {
+		return client
+	}
+	client := createS3Client(region)
+	s3Clients[region] = client
+	return client
+}
+
+func getSQSClient(region string) *sqs.Client {
+	if client, ok := sqsClients[region]; ok {
+		return client
+	}
+	client := createSQSClient(region)
+	sqsClients[region] = client
+	return client
 }
 
 func main() {
