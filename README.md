@@ -1,1 +1,1 @@
-# File Compress Lambda Test
+# File Compress Lambda Test GO Version
